@@ -40,4 +40,24 @@ $("test").addEventListener("click", async () => {
   });
 });
 
+$("syncNow").addEventListener("click", async () => {
+  showStatus("Looking for an open LeetCode tab\u2026", "");
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab || !tab.url || !/^https:\/\/leetcode\.com\/problems\//.test(tab.url)) {
+    showStatus("Open a LeetCode problem page first, then try again.", "err");
+    return;
+  }
+  chrome.tabs.sendMessage(tab.id, { type: "LEETSYNC_TRIGGER_MANUAL_SYNC" }, (res) => {
+    if (chrome.runtime.lastError) {
+      showStatus("Couldn't reach that tab \u2014 try refreshing the LeetCode page.", "err");
+      return;
+    }
+    if (res && res.ok) {
+      showStatus("Sync requested \u2014 check the toolbar icon for the result.", "ok");
+    } else {
+      showStatus("Something went wrong requesting the sync.", "err");
+    }
+  });
+});
+
 load();

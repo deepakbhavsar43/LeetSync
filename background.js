@@ -51,6 +51,14 @@ function paddedProblemId(id) {
   return String(n).padStart(4, "0");
 }
 
+function extFor(lang) {
+  return EXT_MAP[String(lang || "").toLowerCase()] || "txt";
+}
+
+function fileNameFor(lang, ext) {
+  return `solution.${slugify(lang || "code")}.${ext}`;
+}
+
 async function getSettings() {
   return chrome.storage.local.get(["pat", "owner", "repo", "branch", "lastSubmissionId"]);
 }
@@ -78,7 +86,7 @@ function setBadge(text, color) {
   if (text) setTimeout(() => chrome.action.setBadgeText({ text: "" }), 5000);
 }
 
-// --- Read-only GitHub helpers (Contents API \u2014 fine for GETs) --------------
+// --- Read-only GitHub helpers (Contents API — fine for GETs) --------------
 
 async function ghGetFile(owner, repo, pat, path, branch) {
   const ref = branch ? `?ref=${encodeURIComponent(branch)}` : "";
@@ -165,11 +173,11 @@ async function upsertRef(owner, repo, pat, branch, commitSha, isNewBranch) {
 
 // --- Markdown builders -------------------------------------------------
 
-function buildProblemReadme(payload, ext) {
-  const langLabel = payload.lang || "code";
+// languageSolutions: [{ lang, ext, code, runtime, memory }], most-recently-synced first
+function buildProblemReadme(payload, languageSolutions) {
   let md = `# ${payload.questionId ? payload.questionId + ". " : ""}${payload.title}\n\n`;
   if (payload.isManual) {
-    md += `> \u26a0\ufe0f Synced manually via "Sync Now" \u2014 not necessarily an accepted submission.\n\n`;
+    md += `> \u26a0\ufe0f Last synced manually via "Sync Now" \u2014 not necessarily an accepted submission.\n\n`;
   }
   if (payload.difficulty) md += `**Difficulty:** ${payload.difficulty}\n\n`;
   md += `**Link:** https://leetcode.com/problems/${payload.slug}/\n\n`;
@@ -177,9 +185,13 @@ function buildProblemReadme(payload, ext) {
     md += `**Topics:** ${payload.topics.join(", ")}\n\n`;
   }
   md += `## Problem\n\n${payload.descriptionMarkdown || "_Description unavailable \u2014 see the link above._"}\n\n`;
-  md += `## Solution (${langLabel})\n\n\`\`\`${ext}\n${payload.code}\n\`\`\`\n`;
-  if (payload.runtime || payload.memory) {
-    md += `\n*Runtime: ${payload.runtime || "n/a"} \u00b7 Memory: ${payload.memory || "n/a"}*\n`;
+
+  for (const sol of languageSolutions) {
+    md += `## Solution (${sol.lang || "code"})\n\n\`\`\`${sol.ext}\n${sol.code}\n\`\`\`\n`;
+    if (sol.runtime || sol.memory) {
+      md += `\n*Runtime: ${sol.runtime || "n/a"} \u00b7 Memory: ${sol.memory || "n/a"}*\n`;
+    }
+    md += `\n`;
   }
   return md;
 }
@@ -198,6 +210,9 @@ function buildRootReadme(entries) {
     if (counts[e.difficulty] !== undefined) counts[e.difficulty]++;
   });
 
+  const langsFor = (e) =>
+    (e.languages && e.languages.length ? e.languages.map((l) => l.lang) : [e.lang]).filter(Boolean).join(", ");
+
   let md = `# LeetCode Solutions\n\n`;
   md += `Auto-synced by LeetSync \u2014 ${entries.length} problem(s) solved.\n\n`;
   md += `| Easy | Medium | Hard |\n|---|---|---|\n| ${counts.Easy} | ${counts.Medium} | ${counts.Hard} |\n\n`;
@@ -210,7 +225,7 @@ function buildRootReadme(entries) {
       (a, b) => (parseInt(a.questionId) || 0) - (parseInt(b.questionId) || 0)
     );
     for (const e of list) {
-      md += `- [${e.questionId ? e.questionId + ". " : ""}${e.title}](./${e.folder}/) \`${e.difficulty || "?"}\`\n`;
+      md += `- [${e.questionId ? e.questionId + ". " : ""}${e.title}](./${e.folder}/) \`${e.difficulty || "?"}\` \u2013 ${langsFor(e)}\n`;
     }
     md += `\n`;
   }
@@ -218,46 +233,34 @@ function buildRootReadme(entries) {
   md += `## All Problems (most recent first)\n\n`;
   const recent = [...entries].sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
   for (const e of recent) {
-    md += `- [${e.questionId ? e.questionId + ". " : ""}${e.title}](./${e.folder}/) \`${e.difficulty || "?"}\` \u2013 ${e.lang || ""}\n`;
+    md += `- [${e.questionId ? e.questionId + ". " : ""}${e.title}](./${e.folder}/) \`${e.difficulty || "?"}\` \u2013 ${langsFor(e)}\n`;
   }
 
   return md;
 }
 
-// --- Main push flow: one atomic commit, skipped entirely if unchanged ----
+// --- Main push flow: one atomic commit, multi-language aware -------------
 
 async function pushToGitHub(payload) {
   console.log("[LeetSync] pushToGitHub called with:", payload);
   const { pat, owner, repo, branch: branchSetting } = await getSettings();
-  console.log("[LeetSync] settings loaded:", { hasPat: !!pat, owner, repo, branch: branchSetting });
   if (!pat || !owner || !repo) {
     setBadge("!", "#e67e22");
     return { ok: false, error: "Set your token, owner, and repo in the extension popup first." };
   }
 
-  const ext = EXT_MAP[String(payload.lang || "").toLowerCase()] || "txt";
+  const ext = extFor(payload.lang);
   const problemSlug = slugify(payload.slug || payload.title);
   const idPrefix = paddedProblemId(payload.questionId);
   const problemFolderName = idPrefix ? `${idPrefix}-${problemSlug}` : problemSlug;
   const categorySlug = primaryCategorySlug(payload.topics);
   const folder = `${categorySlug}/${problemFolderName}`;
-  const solutionPath = `${folder}/solution.${ext}`;
+  const fileName = fileNameFor(payload.lang, ext);
+  const solutionPath = `${folder}/${fileName}`;
   const readmePath = `${folder}/README.md`;
 
   try {
-    // --- Skip-if-unchanged: don't commit anything if the code is identical
-    // to what's already there AND it's still in the same category folder.
-    const existingSolution = await ghGetFile(owner, repo, pat, solutionPath, branchSetting);
-    if (existingSolution) {
-      const existingCode = b64DecodeUnicode(existingSolution.content);
-      if (existingCode === payload.code) {
-        console.log("[LeetSync] code unchanged since last sync \u2014 skipping push for", folder);
-        setBadge("=", "#95a5a6");
-        return { ok: true, skipped: true, reason: "unchanged" };
-      }
-    }
-
-    // --- Read the current manifest (read-only) to compute the new state ---
+    // --- Read manifest & find this problem's existing entry ---
     let entries = [];
     const manifestFile = await ghGetFile(owner, repo, pat, MANIFEST_PATH, branchSetting);
     if (manifestFile) {
@@ -268,8 +271,72 @@ async function pushToGitHub(payload) {
       }
     }
     const idx = entries.findIndex((e) => e.slug === payload.slug);
-    const previousFolder = idx >= 0 ? entries[idx].folder : null;
-    const previousLang = idx >= 0 ? entries[idx].lang : null;
+    const existingEntry = idx >= 0 ? entries[idx] : null;
+    const previousFolder = existingEntry ? existingEntry.folder : null;
+
+    // Normalize legacy single-language entries (from before multi-language
+    // support) into the new `languages: [...]` shape. Their file was named
+    // "solution.<ext>" with no language slug in it.
+    let languages = [];
+    let legacyPath = null;
+    if (existingEntry) {
+      if (Array.isArray(existingEntry.languages)) {
+        languages = existingEntry.languages.map((l) => ({ ...l }));
+      } else if (existingEntry.lang) {
+        const legacyExt = extFor(existingEntry.lang);
+        legacyPath = `${previousFolder}/solution.${legacyExt}`;
+        languages = [{ lang: existingEntry.lang, ext: legacyExt, fileName: fileNameFor(existingEntry.lang, legacyExt) }];
+      }
+    }
+
+    // --- Skip-if-unchanged: compare against whatever's already stored for
+    // THIS language (new-style path, or the legacy path if it's that language).
+    const currentLangEntry = languages.find((l) => l.lang === payload.lang);
+    const pathForThisLangToday =
+      legacyPath && currentLangEntry && currentLangEntry.lang === payload.lang && previousFolder === folder
+        ? legacyPath
+        : `${folder}/${fileName}`;
+    const existingSolution = await ghGetFile(owner, repo, pat, pathForThisLangToday, branchSetting);
+    if (existingSolution) {
+      const existingCode = b64DecodeUnicode(existingSolution.content);
+      if (existingCode === payload.code && previousFolder === folder) {
+        console.log("[LeetSync] code unchanged since last sync \u2014 skipping push for", folder, payload.lang);
+        setBadge("=", "#95a5a6");
+        return { ok: true, skipped: true, reason: "unchanged" };
+      }
+    }
+
+    // --- Gather code for every OTHER language already synced for this
+    // problem, so the combined README/tree includes all of them. ---
+    const treeDeletes = [];
+    const otherLanguageSolutions = [];
+    for (const l of languages) {
+      if (l.lang === payload.lang) continue; // that one is the fresh submission, handled separately
+      const readFrom = legacyPath && l.lang === (existingEntry && existingEntry.lang) ? legacyPath : `${previousFolder}/${l.fileName}`;
+      const f = await ghGetFile(owner, repo, pat, readFrom, branchSetting);
+      if (f) {
+        otherLanguageSolutions.push({ lang: l.lang, ext: l.ext, code: b64DecodeUnicode(f.content) });
+      }
+      if (readFrom !== `${folder}/${l.fileName}`) {
+        treeDeletes.push(readFrom);
+      }
+    }
+    if (legacyPath && (existingEntry && existingEntry.lang) === payload.lang) {
+      // the legacy file IS this language — it'll be replaced by the fresh
+      // submission below, so just make sure the old-named path is removed.
+      if (!treeDeletes.includes(legacyPath)) treeDeletes.push(legacyPath);
+    }
+
+    // --- Upsert this language's entry ---
+    const freshLangEntry = { lang: payload.lang, ext, fileName, updatedAt: new Date().toISOString() };
+    const langIdx = languages.findIndex((l) => l.lang === payload.lang);
+    if (langIdx >= 0) languages[langIdx] = freshLangEntry;
+    else languages.push(freshLangEntry);
+
+    const languageSolutions = [
+      { lang: payload.lang, ext, code: payload.code, runtime: payload.runtime, memory: payload.memory },
+      ...otherLanguageSolutions,
+    ];
 
     const entry = {
       slug: payload.slug,
@@ -278,13 +345,13 @@ async function pushToGitHub(payload) {
       difficulty: payload.difficulty,
       topics: payload.topics || [],
       folder,
-      lang: payload.lang,
+      languages,
       updatedAt: new Date().toISOString(),
     };
     if (idx >= 0) entries[idx] = entry;
     else entries.push(entry);
 
-    const problemReadmeMd = buildProblemReadme(payload, ext);
+    const problemReadmeMd = buildProblemReadme(payload, languageSolutions);
     const manifestJson = JSON.stringify({ entries }, null, 2);
     const rootReadmeMd = buildRootReadme(entries);
 
@@ -300,14 +367,15 @@ async function pushToGitHub(payload) {
       { path: "README.md", mode: "100644", type: "blob", content: rootReadmeMd },
     ];
 
-    // If this problem's category folder changed since the last sync (e.g.
-    // topic tags were empty before and now resolve to a real category),
-    // remove the old files so it doesn't end up duplicated in two folders.
-    if (previousFolder && previousFolder !== folder && baseTreeSha) {
-      const oldExt = EXT_MAP[String(previousLang || "").toLowerCase()] || "txt";
-      treeEntries.push({ path: `${previousFolder}/solution.${oldExt}`, mode: "100644", type: "blob", sha: null });
-      treeEntries.push({ path: `${previousFolder}/README.md`, mode: "100644", type: "blob", sha: null });
-      console.log("[LeetSync] category changed, moving folder:", previousFolder, "\u2192", folder);
+    for (const otherSol of otherLanguageSolutions) {
+      const l = languages.find((x) => x.lang === otherSol.lang);
+      treeEntries.push({ path: `${folder}/${l.fileName}`, mode: "100644", type: "blob", content: otherSol.code });
+    }
+
+    for (const delPath of treeDeletes) {
+      if (delPath === solutionPath) continue; // being overwritten with fresh content above, don't also delete it
+      treeEntries.push({ path: delPath, mode: "100644", type: "blob", sha: null });
+      console.log("[LeetSync] removing stale path:", delPath);
     }
 
     const newTreeSha = await createTree(owner, repo, pat, baseTreeSha, treeEntries);

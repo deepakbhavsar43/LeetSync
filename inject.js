@@ -13,6 +13,7 @@
   // (which reports the real display name for ANY language) doesn't arrive in time.
   const LANG_FALLBACK_CATEGORY = {
     pythondata: "Pandas",
+    numpy: "NumPy",
     mysql: "MySQL",
     mssql: "MS SQL Server",
     oraclesql: "Oracle SQL",
@@ -128,6 +129,74 @@
     return null;
   }
 
+  function getMonacoLanguageId() {
+    try {
+      if (window.monaco && window.monaco.editor) {
+        const models = window.monaco.editor.getModels();
+        if (models && models.length) {
+          const model = models[models.length - 1];
+          if (typeof model.getLanguageId === "function") return model.getLanguageId();
+          if (typeof model.getModeId === "function") return model.getModeId();
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  // Last-resort fallback for manual sync: read the code straight out of the
+  // rendered DOM instead of Monaco's JS API (which isn't reachable on this
+  // LeetCode build). Monaco renders each visible line as a ".view-line" div
+  // positioned with an absolute "top" offset, so we sort by that to preserve
+  // line order. LeetCode's editor may also live inside an open shadow root,
+  // so this searches recursively through any shadow trees it can reach.
+  // Caveat: for very long files, Monaco only renders lines near the current
+  // scroll position (virtualization), so this can miss lines scrolled out of
+  // view; and if the shadow root is "closed" mode, no external script
+  // (including this one) can see inside it at all.
+  function queryAllDeep(selector, root) {
+    root = root || document;
+    let results = [];
+    try {
+      results = Array.from(root.querySelectorAll(selector));
+    } catch (e) {}
+    let allEls = [];
+    try {
+      allEls = root.querySelectorAll("*");
+    } catch (e) {}
+    for (const el of allEls) {
+      if (el.shadowRoot) {
+        results = results.concat(queryAllDeep(selector, el.shadowRoot));
+      }
+    }
+    return results;
+  }
+
+  function getCodeFromDOM() {
+    try {
+      const editors = queryAllDeep(".monaco-editor");
+      console.log("[LeetSync] getCodeFromDOM found .monaco-editor elements:", editors.length);
+      if (!editors.length) return null;
+      let best = null;
+      let bestCount = 0;
+      for (const ed of editors) {
+        const count = queryAllDeep(".view-line", ed).length;
+        if (count > bestCount) {
+          best = ed;
+          bestCount = count;
+        }
+      }
+      console.log("[LeetSync] getCodeFromDOM best .view-line count:", bestCount);
+      if (!best) return null;
+      const lineElements = queryAllDeep(".view-line", best);
+      lineElements.sort((a, b) => (parseFloat(a.style.top) || 0) - (parseFloat(b.style.top) || 0));
+      const text = lineElements.map((el) => el.textContent.replace(/\u00a0/g, " ")).join("\n");
+      return text || null;
+    } catch (e) {
+      console.log("[LeetSync] getCodeFromDOM error:", e);
+      return null;
+    }
+  }
+
   function getSlug() {
     const m = window.location.pathname.match(/\/problems\/([^/]+)/);
     return m ? m[1] : null;
@@ -225,6 +294,7 @@
               difficulty
               content
               topicTags { name slug }
+              codeSnippets { langSlug }
             }
           }`,
         }),
@@ -234,6 +304,22 @@
     } catch (e) {
       return null;
     }
+  }
+
+  // If a problem has no topicTags, check whether EVERY language it supports
+  // at all belongs to one non-algorithm track (Pandas/NumPy/MySQL/etc.) \u2014
+  // this comes straight from the problem's own metadata (codeSnippets), so it
+  // works whether or not an actual submission/grading just happened.
+  function deriveCategoryFromSnippets(q) {
+    if (!q || !q.codeSnippets || !q.codeSnippets.length) return null;
+    const mapped = q.codeSnippets
+      .map((s) => LANG_FALLBACK_CATEGORY[String(s.langSlug || "").toLowerCase()])
+      .filter(Boolean);
+    const unique = Array.from(new Set(mapped));
+    if (unique.length === 1 && mapped.length === q.codeSnippets.length) {
+      return unique[0];
+    }
+    return null;
   }
 
   let lastHandledSubmissionId = null;
@@ -258,9 +344,10 @@
 
     const rawLang = (data.lang || lastSubmittedLang || "").toLowerCase();
     const liveVerboseName = sd && sd.lang && sd.lang.verboseName;
+    const snippetCategory = deriveCategoryFromSnippets(q);
     let topics = q && q.topicTags ? q.topicTags.map((t) => t.name) : [];
     if (!topics.length) {
-      const fallbackCategory = liveVerboseName || LANG_FALLBACK_CATEGORY[rawLang];
+      const fallbackCategory = liveVerboseName || snippetCategory || LANG_FALLBACK_CATEGORY[rawLang];
       if (fallbackCategory) {
         topics = [fallbackCategory];
         console.log("[LeetSync] no topicTags \u2014 using language category:", fallbackCategory);
@@ -294,4 +381,58 @@
     console.log("[LeetSync] posting payload to content script:", payload);
     window.postMessage({ source: "leetsync-inject", type: "LEETSYNC_ACCEPTED", payload }, "*");
   }
+
+  // Manual "Sync Now" path: pushes whatever code is in the editor right now,
+  // without requiring a fresh Accepted result. Triggered by the popup via
+  // content.js relaying a request into this page context.
+  async function performManualSync() {
+    console.log("[LeetSync] manual sync requested.");
+    const code = getCode() || lastSubmittedCode || getCodeFromDOM();
+    console.log("[LeetSync] manual sync code source length:", code ? code.length : null);
+    if (!code) {
+      console.log("[LeetSync] manual sync aborted \u2014 no code found in the editor.");
+      window.postMessage({ source: "leetsync-inject", type: "LEETSYNC_MANUAL_SYNC_FAILED", reason: "no-code" }, "*");
+      return;
+    }
+
+    const slug = getSlug();
+    const q = await fetchQuestionData(slug);
+    const rawLang = (lastSubmittedLang || getMonacoLanguageId() || "").toLowerCase();
+
+    let topics = q && q.topicTags ? q.topicTags.map((t) => t.name) : [];
+    if (!topics.length) {
+      const fallbackCategory = deriveCategoryFromSnippets(q) || LANG_FALLBACK_CATEGORY[rawLang];
+      if (fallbackCategory) {
+        topics = [fallbackCategory];
+        console.log("[LeetSync] manual sync: no topicTags \u2014 using language category:", fallbackCategory);
+      }
+    }
+
+    const payload = {
+      slug,
+      title: getTitle(),
+      lang: lastSubmittedLang || getMonacoLanguageId() || null,
+      runtime: null,
+      memory: null,
+      code,
+      submissionId: null, // manual syncs aren't deduplicated by submission id
+      timestamp: Date.now(),
+      questionId: (q && (q.questionFrontendId || q.questionId)) || null,
+      difficulty: (q && q.difficulty) || null,
+      topics,
+      descriptionMarkdown: q && q.content ? htmlToMarkdown(q.content) : null,
+      isManual: true,
+    };
+
+    console.log("[LeetSync] posting manual-sync payload to content script:", payload);
+    window.postMessage({ source: "leetsync-inject", type: "LEETSYNC_ACCEPTED", payload }, "*");
+  }
+
+  window.addEventListener("message", (event) => {
+    if (event.source !== window) return;
+    const msg = event.data;
+    if (msg && msg.source === "leetsync-content" && msg.type === "LEETSYNC_MANUAL_SYNC_REQUEST") {
+      performManualSync();
+    }
+  });
 })();

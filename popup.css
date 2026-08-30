@@ -72,6 +72,13 @@ button.secondary {
   color: #1c1c1e;
 }
 
+button.full-width {
+  width: 100%;
+  margin-top: 8px;
+  background: #1c1c1e;
+  color: white;
+}
+
 button:hover {
   filter: brightness(0.95);
 }
