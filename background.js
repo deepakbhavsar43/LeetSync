@@ -40,6 +40,17 @@ function slugify(s) {
     .replace(/(^-|-$)/g, "");
 }
 
+function primaryCategorySlug(topics) {
+  const primary = topics && topics.length ? topics[0] : "Uncategorized";
+  return slugify(primary);
+}
+
+function paddedProblemId(id) {
+  const n = parseInt(id, 10);
+  if (isNaN(n)) return null;
+  return String(n).padStart(4, "0");
+}
+
 async function getSettings() {
   return chrome.storage.local.get(["pat", "owner", "repo", "branch", "lastSubmissionId"]);
 }
@@ -157,6 +168,9 @@ async function upsertRef(owner, repo, pat, branch, commitSha, isNewBranch) {
 function buildProblemReadme(payload, ext) {
   const langLabel = payload.lang || "code";
   let md = `# ${payload.questionId ? payload.questionId + ". " : ""}${payload.title}\n\n`;
+  if (payload.isManual) {
+    md += `> \u26a0\ufe0f Synced manually via "Sync Now" \u2014 not necessarily an accepted submission.\n\n`;
+  }
   if (payload.difficulty) md += `**Difficulty:** ${payload.difficulty}\n\n`;
   md += `**Link:** https://leetcode.com/problems/${payload.slug}/\n\n`;
   if (payload.topics && payload.topics.length) {
@@ -222,13 +236,17 @@ async function pushToGitHub(payload) {
   }
 
   const ext = EXT_MAP[String(payload.lang || "").toLowerCase()] || "txt";
-  const folder = slugify(payload.slug || payload.title);
+  const problemSlug = slugify(payload.slug || payload.title);
+  const idPrefix = paddedProblemId(payload.questionId);
+  const problemFolderName = idPrefix ? `${idPrefix}-${problemSlug}` : problemSlug;
+  const categorySlug = primaryCategorySlug(payload.topics);
+  const folder = `${categorySlug}/${problemFolderName}`;
   const solutionPath = `${folder}/solution.${ext}`;
   const readmePath = `${folder}/README.md`;
 
   try {
     // --- Skip-if-unchanged: don't commit anything if the code is identical
-    // to what's already there (common when resubmitting to test something).
+    // to what's already there AND it's still in the same category folder.
     const existingSolution = await ghGetFile(owner, repo, pat, solutionPath, branchSetting);
     if (existingSolution) {
       const existingCode = b64DecodeUnicode(existingSolution.content);
@@ -249,6 +267,10 @@ async function pushToGitHub(payload) {
         entries = [];
       }
     }
+    const idx = entries.findIndex((e) => e.slug === payload.slug);
+    const previousFolder = idx >= 0 ? entries[idx].folder : null;
+    const previousLang = idx >= 0 ? entries[idx].lang : null;
+
     const entry = {
       slug: payload.slug,
       title: payload.title,
@@ -259,7 +281,6 @@ async function pushToGitHub(payload) {
       lang: payload.lang,
       updatedAt: new Date().toISOString(),
     };
-    const idx = entries.findIndex((e) => e.slug === payload.slug);
     if (idx >= 0) entries[idx] = entry;
     else entries.push(entry);
 
@@ -267,7 +288,7 @@ async function pushToGitHub(payload) {
     const manifestJson = JSON.stringify({ entries }, null, 2);
     const rootReadmeMd = buildRootReadme(entries);
 
-    // --- Build ONE commit containing all 4 file changes ---
+    // --- Build ONE commit containing all file changes ---
     const branch = await resolveBranch(owner, repo, pat, branchSetting);
     const latestCommitSha = await getRefShaOrNull(owner, repo, pat, branch);
     const baseTreeSha = latestCommitSha ? await getCommitTreeSha(owner, repo, pat, latestCommitSha) : null;
@@ -279,8 +300,20 @@ async function pushToGitHub(payload) {
       { path: "README.md", mode: "100644", type: "blob", content: rootReadmeMd },
     ];
 
+    // If this problem's category folder changed since the last sync (e.g.
+    // topic tags were empty before and now resolve to a real category),
+    // remove the old files so it doesn't end up duplicated in two folders.
+    if (previousFolder && previousFolder !== folder && baseTreeSha) {
+      const oldExt = EXT_MAP[String(previousLang || "").toLowerCase()] || "txt";
+      treeEntries.push({ path: `${previousFolder}/solution.${oldExt}`, mode: "100644", type: "blob", sha: null });
+      treeEntries.push({ path: `${previousFolder}/README.md`, mode: "100644", type: "blob", sha: null });
+      console.log("[LeetSync] category changed, moving folder:", previousFolder, "\u2192", folder);
+    }
+
     const newTreeSha = await createTree(owner, repo, pat, baseTreeSha, treeEntries);
-    const commitMessage = `LeetCode: ${payload.title} (${payload.lang || "unknown"}) \u2013 Accepted`;
+    const commitMessage = payload.isManual
+      ? `LeetCode: ${payload.title} (${payload.lang || "unknown"}) \u2013 manual sync`
+      : `LeetCode: ${payload.title} (${payload.lang || "unknown"}) \u2013 Accepted`;
     const newCommitSha = await createCommit(owner, repo, pat, commitMessage, newTreeSha, latestCommitSha);
     await upsertRef(owner, repo, pat, branch, newCommitSha, !latestCommitSha);
 
