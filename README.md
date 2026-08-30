@@ -39,8 +39,9 @@ LeetSync skips all of that:
    and topic tags, converting the HTML description to Markdown.
 3. It hands that whole payload to `content.js` via `window.postMessage`
    (same-page — nothing leaves the tab at this point).
-4. `content.js` forwards it to `background.js`, which writes four things to
-   your repo via GitHub's Contents API:
+4. `content.js` forwards it to `background.js`, which builds **one atomic
+   commit** containing all 4 file changes via GitHub's Git Data API
+   (blobs → tree → commit → ref update):
    - `<problem-slug>/solution.<ext>` — your accepted code
    - `<problem-slug>/README.md` — problem statement, examples, topics,
      difficulty, and the solution code embedded in a fenced block
@@ -49,13 +50,13 @@ LeetSync skips all of that:
      truth for the next file
    - `README.md` at the repo root — regenerated from the manifest every time,
      grouping all solved problems under headings by topic (Array, Linked
-     List, Dynamic Programming, etc.), plus an easy/medium/hard count and a
-     most-recent-first list
+     List, Dynamic Programming, Pandas, etc.), plus an easy/medium/hard count
+     and a most-recent-first list
 
-   Each of the four is a separate commit (simple Contents-API calls rather
-   than an atomic multi-file commit), so one accepted submission produces a
-   short burst of commits rather than one. All four calls still only ever
-   hit `api.github.com`.
+   Before building that commit, it also compares your new code against
+   whatever's already saved for that problem — if they're identical (e.g.
+   you resubmitted to double-check something), it skips the push entirely
+   rather than creating a no-op commit.
 
 ## Setup
 
@@ -65,7 +66,9 @@ LeetSync skips all of that:
    - Repository access: "Only select repositories" → pick (or create) the one
      repo you want your solutions pushed to.
    - Permissions → Repository permissions → **Contents: Read and write**.
-     Leave everything else at "No access".
+     Leave everything else at "No access". (This single permission also
+     covers the Git Data API calls \u2014 blobs, trees, commits, refs \u2014 that
+     LeetSync uses to make one atomic commit per submission.)
    - Generate, copy the token (`github_pat_...`).
 
 2. **Load the extension**

@@ -52,12 +52,6 @@ function ghHeaders(pat) {
   };
 }
 
-function b64EncodeUnicode(str) {
-  return btoa(
-    encodeURIComponent(str).replace(/%([0-9A-F]{2})/g, (_, p1) => String.fromCharCode("0x" + p1))
-  );
-}
-
 function b64DecodeUnicode(str) {
   const clean = str.replace(/\n/g, "");
   return decodeURIComponent(
@@ -73,7 +67,7 @@ function setBadge(text, color) {
   if (text) setTimeout(() => chrome.action.setBadgeText({ text: "" }), 5000);
 }
 
-// --- Thin GitHub Contents API helpers -------------------------------------
+// --- Read-only GitHub helpers (Contents API \u2014 fine for GETs) --------------
 
 async function ghGetFile(owner, repo, pat, path, branch) {
   const ref = branch ? `?ref=${encodeURIComponent(branch)}` : "";
@@ -86,16 +80,75 @@ async function ghGetFile(owner, repo, pat, path, branch) {
   throw new Error(`GET ${path} failed (${res.status}): ${await res.text()}`);
 }
 
-async function ghPutFile(owner, repo, pat, path, contentStr, message, sha, branch) {
-  const body = { message, content: b64EncodeUnicode(contentStr) };
-  if (sha) body.sha = sha;
-  if (branch) body.branch = branch;
-  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path}`, {
-    method: "PUT",
+// --- Git Data API helpers (for one atomic multi-file commit) --------------
+
+async function resolveBranch(owner, repo, pat, branchSetting) {
+  if (branchSetting) return branchSetting;
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers: ghHeaders(pat) });
+  if (!res.ok) throw new Error(`GET repo failed (${res.status}): ${await res.text()}`);
+  const j = await res.json();
+  return j.default_branch || "main";
+}
+
+async function getRefShaOrNull(owner, repo, pat, branch) {
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(branch)}`,
+    { headers: ghHeaders(pat) }
+  );
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`GET ref failed (${res.status}): ${await res.text()}`);
+  const j = await res.json();
+  return j.object.sha;
+}
+
+async function getCommitTreeSha(owner, repo, pat, commitSha) {
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/commits/${commitSha}`, {
+    headers: ghHeaders(pat),
+  });
+  if (!res.ok) throw new Error(`GET commit failed (${res.status}): ${await res.text()}`);
+  const j = await res.json();
+  return j.tree.sha;
+}
+
+async function createTree(owner, repo, pat, baseTreeSha, entries) {
+  const body = { tree: entries };
+  if (baseTreeSha) body.base_tree = baseTreeSha;
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees`, {
+    method: "POST",
     headers: ghHeaders(pat),
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`PUT ${path} failed (${res.status}): ${await res.text()}`);
+  if (!res.ok) throw new Error(`POST tree failed (${res.status}): ${await res.text()}`);
+  return (await res.json()).sha;
+}
+
+async function createCommit(owner, repo, pat, message, treeSha, parentSha) {
+  const body = { message, tree: treeSha };
+  if (parentSha) body.parents = [parentSha];
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/commits`, {
+    method: "POST",
+    headers: ghHeaders(pat),
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`POST commit failed (${res.status}): ${await res.text()}`);
+  return (await res.json()).sha;
+}
+
+async function upsertRef(owner, repo, pat, branch, commitSha, isNewBranch) {
+  if (isNewBranch) {
+    const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/refs`, {
+      method: "POST",
+      headers: ghHeaders(pat),
+      body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: commitSha }),
+    });
+    if (!res.ok) throw new Error(`POST ref failed (${res.status}): ${await res.text()}`);
+    return res.json();
+  }
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${encodeURIComponent(branch)}`,
+    { method: "PATCH", headers: ghHeaders(pat), body: JSON.stringify({ sha: commitSha }) }
+  );
+  if (!res.ok) throw new Error(`PATCH ref failed (${res.status}): ${await res.text()}`);
   return res.json();
 }
 
@@ -157,15 +210,14 @@ function buildRootReadme(entries) {
   return md;
 }
 
-// --- Main push flow ------------------------------------------------------
+// --- Main push flow: one atomic commit, skipped entirely if unchanged ----
 
 async function pushToGitHub(payload) {
   console.log("[LeetSync] pushToGitHub called with:", payload);
-  const { pat, owner, repo, branch } = await getSettings();
-  console.log("[LeetSync] settings loaded:", { hasPat: !!pat, owner, repo, branch });
+  const { pat, owner, repo, branch: branchSetting } = await getSettings();
+  console.log("[LeetSync] settings loaded:", { hasPat: !!pat, owner, repo, branch: branchSetting });
   if (!pat || !owner || !repo) {
     setBadge("!", "#e67e22");
-    console.log("[LeetSync] missing settings, aborting push.");
     return { ok: false, error: "Set your token, owner, and repo in the extension popup first." };
   }
 
@@ -175,38 +227,22 @@ async function pushToGitHub(payload) {
   const readmePath = `${folder}/README.md`;
 
   try {
-    // 1. Solution file
-    const existingSolution = await ghGetFile(owner, repo, pat, solutionPath, branch);
-    await ghPutFile(
-      owner,
-      repo,
-      pat,
-      solutionPath,
-      payload.code,
-      `LeetCode: ${payload.title} (${payload.lang || "unknown"}) \u2013 Accepted`,
-      existingSolution && existingSolution.sha,
-      branch
-    );
+    // --- Skip-if-unchanged: don't commit anything if the code is identical
+    // to what's already there (common when resubmitting to test something).
+    const existingSolution = await ghGetFile(owner, repo, pat, solutionPath, branchSetting);
+    if (existingSolution) {
+      const existingCode = b64DecodeUnicode(existingSolution.content);
+      if (existingCode === payload.code) {
+        console.log("[LeetSync] code unchanged since last sync \u2014 skipping push for", folder);
+        setBadge("=", "#95a5a6");
+        return { ok: true, skipped: true, reason: "unchanged" };
+      }
+    }
 
-    // 2. Per-problem README (problem statement + examples + submitted code)
-    const existingReadme = await ghGetFile(owner, repo, pat, readmePath, branch);
-    await ghPutFile(
-      owner,
-      repo,
-      pat,
-      readmePath,
-      buildProblemReadme(payload, ext),
-      `docs: ${payload.title} README`,
-      existingReadme && existingReadme.sha,
-      branch
-    );
-
-    // 3. Manifest (source of truth for the categorized root README)
+    // --- Read the current manifest (read-only) to compute the new state ---
     let entries = [];
-    let manifestSha = null;
-    const manifestFile = await ghGetFile(owner, repo, pat, MANIFEST_PATH, branch);
+    const manifestFile = await ghGetFile(owner, repo, pat, MANIFEST_PATH, branchSetting);
     if (manifestFile) {
-      manifestSha = manifestFile.sha;
       try {
         entries = JSON.parse(b64DecodeUnicode(manifestFile.content)).entries || [];
       } catch (e) {
@@ -227,33 +263,30 @@ async function pushToGitHub(payload) {
     if (idx >= 0) entries[idx] = entry;
     else entries.push(entry);
 
-    await ghPutFile(
-      owner,
-      repo,
-      pat,
-      MANIFEST_PATH,
-      JSON.stringify({ entries }, null, 2),
-      "chore: update LeetSync manifest",
-      manifestSha,
-      branch
-    );
+    const problemReadmeMd = buildProblemReadme(payload, ext);
+    const manifestJson = JSON.stringify({ entries }, null, 2);
+    const rootReadmeMd = buildRootReadme(entries);
 
-    // 4. Root README, regenerated from the manifest (categories like Array, Linked List, ...)
-    const existingRootReadme = await ghGetFile(owner, repo, pat, "README.md", branch);
-    await ghPutFile(
-      owner,
-      repo,
-      pat,
-      "README.md",
-      buildRootReadme(entries),
-      "docs: update README index",
-      existingRootReadme && existingRootReadme.sha,
-      branch
-    );
+    // --- Build ONE commit containing all 4 file changes ---
+    const branch = await resolveBranch(owner, repo, pat, branchSetting);
+    const latestCommitSha = await getRefShaOrNull(owner, repo, pat, branch);
+    const baseTreeSha = latestCommitSha ? await getCommitTreeSha(owner, repo, pat, latestCommitSha) : null;
 
-    console.log("[LeetSync] all four files pushed successfully.");
+    const treeEntries = [
+      { path: solutionPath, mode: "100644", type: "blob", content: payload.code },
+      { path: readmePath, mode: "100644", type: "blob", content: problemReadmeMd },
+      { path: MANIFEST_PATH, mode: "100644", type: "blob", content: manifestJson },
+      { path: "README.md", mode: "100644", type: "blob", content: rootReadmeMd },
+    ];
+
+    const newTreeSha = await createTree(owner, repo, pat, baseTreeSha, treeEntries);
+    const commitMessage = `LeetCode: ${payload.title} (${payload.lang || "unknown"}) \u2013 Accepted`;
+    const newCommitSha = await createCommit(owner, repo, pat, commitMessage, newTreeSha, latestCommitSha);
+    await upsertRef(owner, repo, pat, branch, newCommitSha, !latestCommitSha);
+
+    console.log("[LeetSync] pushed single atomic commit:", newCommitSha);
     setBadge("\u2713", "#2ecc71");
-    return { ok: true, path: solutionPath };
+    return { ok: true, path: solutionPath, commit: newCommitSha };
   } catch (e) {
     console.log("[LeetSync] pushToGitHub error:", e);
     setBadge("\u2717", "#e74c3c");
