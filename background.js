@@ -196,7 +196,22 @@ function buildProblemReadme(payload, languageSolutions) {
   return md;
 }
 
-function buildRootReadme(entries) {
+function buildBadgesSection(badges) {
+  if (!badges || !badges.length) return "";
+  let md = `## \ud83c\udfc6 Achievements & Badges\n\n`;
+  md += `<table><tr>\n`;
+  badges.forEach((b, i) => {
+    const rawIcon = b.icon ? String(b.icon) : "";
+    const icon = rawIcon ? (rawIcon.startsWith("http") ? rawIcon : `https://leetcode.com${rawIcon}`) : "";
+    const name = b.displayName || b.name || "Badge";
+    md += `<td align="center">${icon ? `<img src="${icon}" width="70"/><br/>` : ""}${name}</td>\n`;
+    if ((i + 1) % 5 === 0 && i !== badges.length - 1) md += `</tr><tr>\n`;
+  });
+  md += `</tr></table>\n\n`;
+  return md;
+}
+
+function buildRootReadme(entries, badges) {
   const byTopic = {};
   for (const e of entries) {
     const topics = e.topics && e.topics.length ? e.topics : ["Uncategorized"];
@@ -216,6 +231,7 @@ function buildRootReadme(entries) {
   let md = `# LeetCode Solutions\n\n`;
   md += `Auto-synced by LeetSync \u2014 ${entries.length} problem(s) solved.\n\n`;
   md += `| Easy | Medium | Hard |\n|---|---|---|\n| ${counts.Easy} | ${counts.Medium} | ${counts.Hard} |\n\n`;
+  md += buildBadgesSection(badges);
   md += `## By Category\n\n`;
 
   const topicNames = Object.keys(byTopic).sort();
@@ -262,14 +278,20 @@ async function pushToGitHub(payload) {
   try {
     // --- Read manifest & find this problem's existing entry ---
     let entries = [];
+    let storedBadges = null;
     const manifestFile = await ghGetFile(owner, repo, pat, MANIFEST_PATH, branchSetting);
     if (manifestFile) {
       try {
-        entries = JSON.parse(b64DecodeUnicode(manifestFile.content)).entries || [];
+        const parsed = JSON.parse(b64DecodeUnicode(manifestFile.content));
+        entries = parsed.entries || [];
+        storedBadges = parsed.badges || null;
       } catch (e) {
         entries = [];
       }
     }
+    // Only overwrite stored badges if this sync actually fetched fresh ones —
+    // a failed/uncached badges fetch shouldn't wipe out what we already have.
+    const badges = payload.badges && payload.badges.length ? payload.badges : storedBadges;
     const idx = entries.findIndex((e) => e.slug === payload.slug);
     const existingEntry = idx >= 0 ? entries[idx] : null;
     const previousFolder = existingEntry ? existingEntry.folder : null;
@@ -352,8 +374,8 @@ async function pushToGitHub(payload) {
     else entries.push(entry);
 
     const problemReadmeMd = buildProblemReadme(payload, languageSolutions);
-    const manifestJson = JSON.stringify({ entries }, null, 2);
-    const rootReadmeMd = buildRootReadme(entries);
+    const manifestJson = JSON.stringify({ entries, badges }, null, 2);
+    const rootReadmeMd = buildRootReadme(entries, badges);
 
     // --- Build ONE commit containing all file changes ---
     const branch = await resolveBranch(owner, repo, pat, branchSetting);

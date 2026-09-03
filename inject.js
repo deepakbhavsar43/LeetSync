@@ -322,6 +322,75 @@
     return null;
   }
 
+  // Badges/username are whole-profile data, not per-problem, so cache them
+  // for an hour rather than re-fetching on every single submission.
+  let cachedUsername = null;
+  let cachedBadges = null;
+  let cachedBadgesAt = 0;
+  const BADGES_CACHE_MS = 60 * 60 * 1000;
+
+  async function fetchCurrentUsername() {
+    if (cachedUsername) return cachedUsername;
+    try {
+      const res = await originalFetch("https://leetcode.com/graphql", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          operationName: "globalData",
+          query: `query globalData { userStatus { username isSignedIn } }`,
+        }),
+      });
+      const json = await res.json();
+      console.log("[LeetSync] userStatus response:", json);
+      const us = json && json.data && json.data.userStatus;
+      if (us && us.isSignedIn && us.username) {
+        cachedUsername = us.username;
+        return cachedUsername;
+      }
+    } catch (e) {
+      console.log("[LeetSync] failed to fetch username:", e);
+    }
+    return null;
+  }
+
+  async function fetchUserBadges() {
+    const now = Date.now();
+    if (cachedBadges && now - cachedBadgesAt < BADGES_CACHE_MS) return cachedBadges;
+    const username = await fetchCurrentUsername();
+    if (!username) return null;
+    try {
+      const res = await originalFetch("https://leetcode.com/graphql", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          operationName: "userBadges",
+          variables: { username },
+          query: `query userBadges($username: String!) {
+            matchedUser(username: $username) {
+              badges {
+                id
+                displayName
+                icon
+                creationDate
+              }
+            }
+          }`,
+        }),
+      });
+      const json = await res.json();
+      console.log("[LeetSync] userBadges response:", json);
+      const badges = json && json.data && json.data.matchedUser ? json.data.matchedUser.badges : null;
+      if (badges) {
+        cachedBadges = badges;
+        cachedBadgesAt = now;
+      }
+      return badges;
+    } catch (e) {
+      console.log("[LeetSync] failed to fetch badges:", e);
+      return null;
+    }
+  }
+
   let lastHandledSubmissionId = null;
 
   async function handleAccepted(data) {
@@ -363,6 +432,8 @@
     }
     lastHandledSubmissionId = submissionId;
 
+    const badges = await fetchUserBadges();
+
     const payload = {
       slug,
       title: getTitle(),
@@ -376,6 +447,7 @@
       difficulty: (q && q.difficulty) || null,
       topics,
       descriptionMarkdown: q && q.content ? htmlToMarkdown(q.content) : null,
+      badges,
     };
 
     console.log("[LeetSync] posting payload to content script:", payload);
@@ -421,6 +493,7 @@
       difficulty: (q && q.difficulty) || null,
       topics,
       descriptionMarkdown: q && q.content ? htmlToMarkdown(q.content) : null,
+      badges: await fetchUserBadges(),
       isManual: true,
     };
 
