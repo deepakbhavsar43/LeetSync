@@ -196,6 +196,28 @@ function buildProblemReadme(payload, languageSolutions) {
   return md;
 }
 
+function shieldBadge(label, value, color) {
+  const enc = (s) => encodeURIComponent(String(s));
+  return `![${label}](https://img.shields.io/badge/${enc(label)}-${enc(value)}-${color})`;
+}
+
+function buildDifficultyBadges(counts, total) {
+  return [
+    shieldBadge("Total Solved", total, "blue"),
+    shieldBadge("Easy", counts.Easy, "brightgreen"),
+    shieldBadge("Medium", counts.Medium, "yellow"),
+    shieldBadge("Hard", counts.Hard, "red"),
+  ].join(" ");
+}
+
+function computeDifficultyCounts(entries) {
+  const counts = { Easy: 0, Medium: 0, Hard: 0 };
+  entries.forEach((e) => {
+    if (counts[e.difficulty] !== undefined) counts[e.difficulty]++;
+  });
+  return counts;
+}
+
 function buildBadgesSection(badges) {
   if (!badges || !badges.length) return "";
   let md = `## \ud83c\udfc6 Achievements & Badges\n\n`;
@@ -220,17 +242,14 @@ function buildRootReadme(entries, badges) {
     }
   }
 
-  const counts = { Easy: 0, Medium: 0, Hard: 0 };
-  entries.forEach((e) => {
-    if (counts[e.difficulty] !== undefined) counts[e.difficulty]++;
-  });
+  const counts = computeDifficultyCounts(entries);
 
   const langsFor = (e) =>
     (e.languages && e.languages.length ? e.languages.map((l) => l.lang) : [e.lang]).filter(Boolean).join(", ");
 
   let md = `# LeetCode Solutions\n\n`;
-  md += `Auto-synced by LeetSync \u2014 ${entries.length} problem(s) solved.\n\n`;
-  md += `| Easy | Medium | Hard |\n|---|---|---|\n| ${counts.Easy} | ${counts.Medium} | ${counts.Hard} |\n\n`;
+  md += `Auto-synced by LeetSync.\n\n`;
+  md += buildDifficultyBadges(counts, entries.length) + "\n\n";
   md += buildBadgesSection(badges);
   md += `## By Category\n\n`;
 
@@ -252,6 +271,34 @@ function buildRootReadme(entries, badges) {
     md += `- [${e.questionId ? e.questionId + ". " : ""}${e.title}](./${e.folder}/) \`${e.difficulty || "?"}\` \u2013 ${langsFor(e)}\n`;
   }
 
+  return md;
+}
+
+// A short, self-contained block meant for pasting into a GitHub *profile*
+// README (the special repo named after your username) rather than this repo.
+function buildProfileSnippet(entries, badges) {
+  const counts = computeDifficultyCounts(entries);
+
+  const langCounts = {};
+  entries.forEach((e) => {
+    const langs = e.languages && e.languages.length ? e.languages.map((l) => l.lang) : [e.lang];
+    langs.filter(Boolean).forEach((l) => {
+      langCounts[l] = (langCounts[l] || 0) + 1;
+    });
+  });
+  const topLangs = Object.entries(langCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5);
+
+  let md = `<!-- LeetSync stats \u2014 paste into your GitHub profile README -->\n\n`;
+  md += `### \ud83d\udcca LeetCode Stats\n\n`;
+  md += buildDifficultyBadges(counts, entries.length) + "\n\n";
+  if (badges && badges.length) {
+    md += `${shieldBadge("Badges Earned", badges.length, "orange")}\n\n`;
+  }
+  if (topLangs.length) {
+    md += `**Languages used:** ${topLangs.map(([l, c]) => `${l} (${c})`).join(", ")}\n\n`;
+  }
   return md;
 }
 
@@ -436,6 +483,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse(result);
     })();
     return true; // keep the message channel open for the async response
+  }
+
+  if (msg.type === "GET_PROFILE_SNIPPET") {
+    (async () => {
+      const { pat, owner, repo, branch } = await getSettings();
+      if (!pat || !owner || !repo) {
+        sendResponse({ ok: false, error: "Set your token, owner, and repo first." });
+        return;
+      }
+      try {
+        const manifestFile = await ghGetFile(owner, repo, pat, MANIFEST_PATH, branch);
+        if (!manifestFile) {
+          sendResponse({ ok: false, error: "No leetsync-manifest.json found yet \u2014 sync at least one problem first." });
+          return;
+        }
+        const parsed = JSON.parse(b64DecodeUnicode(manifestFile.content));
+        const entries = parsed.entries || [];
+        const badges = parsed.badges || null;
+        sendResponse({ ok: true, snippet: buildProfileSnippet(entries, badges) });
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e && e.message ? e.message : e) });
+      }
+    })();
+    return true;
   }
 
   if (msg.type === "TEST_CONNECTION") {

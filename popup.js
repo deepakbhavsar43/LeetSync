@@ -60,4 +60,24 @@ $("syncNow").addEventListener("click", async () => {
   });
 });
 
+$("profileSnippet").addEventListener("click", () => {
+  showStatus("Fetching your stats\u2026", "");
+  chrome.runtime.sendMessage({ type: "GET_PROFILE_SNIPPET" }, (res) => {
+    if (res && res.ok) {
+      const ta = $("snippetOutput");
+      ta.value = res.snippet;
+      ta.style.display = "block";
+      ta.rows = Math.min(12, res.snippet.split("\n").length + 1);
+      ta.focus();
+      ta.select();
+      navigator.clipboard
+        .writeText(res.snippet)
+        .then(() => showStatus("Snippet copied to clipboard!", "ok"))
+        .catch(() => showStatus("Snippet ready below \u2014 select and copy manually.", "ok"));
+    } else {
+      showStatus(res ? res.error : "Something went wrong.", "err");
+    }
+  });
+});
+
 load();
