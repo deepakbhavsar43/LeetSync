@@ -6,46 +6,15 @@
   <link rel="stylesheet" href="popup.css" />
 </head>
 <body>
-  <h1>LeetSync</h1>
-  <p class="subtitle">Talks straight to GitHub. No middleman ever sees your code or token.</p>
-
-  <label>
-    GitHub Fine-Grained Token
-    <input type="password" id="pat" placeholder="github_pat_xxxxxxxx" autocomplete="off" />
-  </label>
-  <label>
-    Repo Owner
-    <input type="text" id="owner" placeholder="your-username" />
-  </label>
-  <label>
-    Repo Name
-    <input type="text" id="repo" placeholder="leetcode-solutions" />
-  </label>
-  <label>
-    Branch <span class="optional">(optional, defaults to the repo's default branch)</span>
-    <input type="text" id="branch" placeholder="main" />
-  </label>
-
-  <div class="buttons">
-    <button id="save">Save</button>
-    <button id="test" class="secondary">Test Connection</button>
+  <div class="header-row">
+    <h1>LeetSync</h1>
+    <button id="openSettings" class="icon-btn" title="Settings">⚙️</button>
   </div>
-  <p id="status"></p>
 
-  <details>
-    <summary>How this stays private</summary>
-    <p>
-      This extension calls <code>api.github.com</code> directly from your browser using a
-      token only you generate and hold. There is no server run by anyone else in the
-      middle — nothing to trust beyond GitHub itself.
-    </p>
-    <ol>
-      <li>On GitHub: Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.</li>
-      <li>Under "Repository access", choose "Only select repositories" and pick just the one repo you want solutions pushed to.</li>
-      <li>Under "Permissions" → "Repository permissions", set <strong>Contents: Read and write</strong>. Leave everything else as "No access".</li>
-      <li>Paste the token above. It's saved only in this browser's local extension storage on this device.</li>
-    </ol>
-  </details>
+  <button id="syncNow" class="full-width">Sync Now</button>
+  <button id="profileSnippet" class="full-width secondary">Generate Profile Snippet</button>
+  <textarea id="snippetOutput" readonly></textarea>
+  <p id="status"></p>
 
   <script src="popup.js"></script>
 </body>

@@ -9,7 +9,7 @@
     "https://api.github.com/*"
   ],
   "background": {
-    "service_worker": "background.js"
+    "scripts": ["background.js"]
   },
   "options_page": "options.html",
   "content_scripts": [
@@ -37,5 +37,11 @@
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "leetsync@example.com",
+      "strict_min_version": "128.0"
+    }
   }
 }
